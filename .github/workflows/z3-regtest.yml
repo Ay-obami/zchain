@@ -1,0 +1,85 @@
+name: Z3 regtest integration
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  z3-regtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out CLI
+        uses: actions/checkout@v4
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Check out official Z3 stack
+        uses: actions/checkout@v4
+        with:
+          repository: ZcashFoundation/z3
+          path: z3-stack
+          persist-credentials: false
+      - name: Start Zebra regtest service
+        run: |
+          set -euo pipefail
+          cd z3-stack
+          ./scripts/setup-network.sh regtest
+          docker compose --env-file .env.regtest up -d zebra
+          docker compose --env-file .env.regtest ps zebra
+      - name: Wait for real Zebra RPC
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 80); do
+            if curl -fsS --max-time 4 -H 'Content-Type: application/json' \
+              --data '{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}' \
+              http://127.0.0.1:29232 | python3 -c 'import json,sys; assert type(json.load(sys.stdin)["result"]) == int' 2>/dev/null; then
+              echo "Zebra regtest is ready"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Zebra RPC did not become ready" >&2
+          exit 1
+      - name: Generate three blocks on regtest
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 60 --user zebra:zebra -H 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","method":"generate","params":[3],"id":2}' \
+            http://127.0.0.1:29232 | tee /tmp/mined.json
+          python3 -c 'import json; obj=json.load(open("/tmp/mined.json")); assert obj.get("error") is None and len(obj["result"]) == 3'
+      - name: Exercise CLI against live Zebra
+        env:
+          ZCHAIN_RPC_URL: http://127.0.0.1:29232
+          ZCHAIN_RPC_USER: zebra
+          ZCHAIN_RPC_PASSWORD: zebra
+        run: |
+          set -euo pipefail
+          echo '$ ./zchain height'
+          ./zchain height | tee /tmp/height.txt
+          python3 -c 'assert int(open("/tmp/height.txt").read()) == 3'
+          echo '$ ./zchain block 3'
+          ./zchain block 3 | tee /tmp/block.json
+          python3 -c 'import json; b=json.load(open("/tmp/block.json")); assert b["height"] == 3 and len(b["hash"]) == 64 and type(b["timestamp"]) is int'
+          echo '$ ./zchain block wrong'
+          if ./zchain block wrong >/tmp/invalid.out 2>/tmp/invalid.err; then
+            echo 'Invalid height must return nonzero' >&2
+            exit 1
+          fi
+          test ! -s /tmp/invalid.out
+          grep -q 'non-negative integer' /tmp/invalid.err
+          cat /tmp/invalid.err
+      - name: Show Zebra logs if failed
+        if: failure()
+        run: |
+          cd z3-stack
+          docker compose --env-file .env.regtest ps zebra || true
+          docker compose --env-file .env.regtest logs --tail=100 zebra || true
+      - name: Stop regtest service
+        if: always()
+        run: |
+          if [ -d z3-stack ]; then
+            cd z3-stack
+            docker compose --env-file .env.regtest down || true
+          fi

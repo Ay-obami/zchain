@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Z3 regtest chain-info CLI. Uses only Python's standard library."""
+import base64
+import json
+import os
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+class RPCError(Exception):
+    """Node connection, JSON-RPC, or response validation failure."""
+
+
+def rpc(method, params):
+    url = os.environ.get("ZCHAIN_RPC_URL", "http://127.0.0.1:29232")
+    username = os.environ.get("ZCHAIN_RPC_USER", "zebra")
+    password = os.environ.get("ZCHAIN_RPC_PASSWORD", "zebra")
+    try:
+        timeout = float(os.environ.get("ZCHAIN_RPC_TIMEOUT", "10"))
+        if timeout <= 0:
+            raise ValueError()
+    except ValueError as exc:
+        raise RPCError("ZCHAIN_RPC_TIMEOUT must be a positive number") from exc
+    payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode("utf-8")
+    request = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    credentials = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    request.add_header("Authorization", f"Basic {credentials}")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            envelope = json.load(response)
+    except HTTPError as exc:
+        raise RPCError(f"RPC HTTP {exc.code} ({exc.reason})") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise RPCError(f"cannot connect to Zebra RPC at {url}: {exc}") from exc
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RPCError(f"invalid JSON returned from Zebra RPC: {exc}") from exc
+    if not isinstance(envelope, dict):
+        raise RPCError("RPC returned an invalid response object")
+    if envelope.get("error") is not None:
+        error = envelope["error"]
+        if isinstance(error, dict):
+            raise RPCError(f"RPC {method} failed ({error.get('code', 'unknown')}): {error.get('message', error)}")
+        raise RPCError(f"RPC {method} failed: {error}")
+    if "result" not in envelope:
+        raise RPCError("RPC response missing result")
+    return envelope["result"]
+
+
+def main(args=None):
+    args = sys.argv[1:] if args is None else args
+    if args == ["height"]:
+        height = rpc("getblockcount", [])
+        if type(height) is not int or height < 0:
+            raise RPCError(f"unexpected getblockcount result: {height!r}")
+        print(height)
+        return 0
+    if len(args) == 2 and args[0] == "block":
+        value = args[1]
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError("block height must be a non-negative integer")
+        height = int(value)
+        block_hash = rpc("getblockhash", [height])
+        if not isinstance(block_hash, str) or len(block_hash) != 64:
+            raise RPCError("Zebra returned an invalid block hash")
+        block = rpc("getblock", [block_hash, 1])
+        if not isinstance(block, dict) or not isinstance(block.get("time"), int):
+            raise RPCError("Zebra returned no block timestamp")
+        if block.get("hash") != block_hash:
+            raise RPCError("Zebra returned a mismatched block hash")
+        print(json.dumps({"height": height, "hash": block_hash, "timestamp": block["time"]}, separators=(",", ":")))
+        return 0
+    raise ValueError("usage: zchain height | zchain block <height>")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, RPCError) as exc:
+        print(f"zchain: error: {exc}", file=sys.stderr)
+        sys.exit(2)
